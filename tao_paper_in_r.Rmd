@@ -1,0 +1,175 @@
+---
+title: "tables"
+author: "Michael Nichols"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r}
+# ================================
+# MLB Table-1 style descriptives
+# (Tao 2016 replication ingredients)
+# Packages used: Lahman, ineq, dplyr/tidyverse
+# ================================
+
+# 0) Packages
+pkgs <- c("tidyverse","Lahman","ineq")
+need <- pkgs[!pkgs %in% installed.packages()[,"Package"]]
+if(length(need)>0) install.packages(need, repos="https://cloud.r-project.org")
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# 1) Years covered in the paper
+years <- 1985:2013
+
+# 2) Core tables from Lahman
+data("Salaries"); data("Teams"); data("Pitching"); data("Batting"); data("Managers")
+
+# 3) Team outcomes & league id
+teams_base <- Teams %>%
+  filter(yearID %in% years) %>%
+  transmute(year = yearID,
+            teamID,
+            lgID,
+            W, L,
+            win_pct = if_else((W+L) > 0, W/(W+L), NA_real_),
+            nl = as.integer(lgID == "NL"))
+
+# 4) Team-average salary and dispersion (Gini/HHI) on top-25 salaries
+sal_yr <- Salaries %>%
+  filter(yearID %in% years) %>%
+  transmute(year = yearID, teamID, playerID, salary)
+
+team_pay <- sal_yr %>%
+  group_by(year, teamID) %>%
+  summarise(
+    # average salary across all players on the team that year
+    team_avg_salary = mean(salary, na.rm = TRUE),
+    # take top-25 paid and compute Gini/HHI (paper’s approach)
+    gini = {
+      v <- sal_yr$salary[sal_yr$year==first(year) & sal_yr$teamID==first(teamID)]
+      v <- sort(v, decreasing = TRUE)
+      v <- v[!is.na(v) & v > 0]
+      v <- head(v, 25)
+      if(length(v) >= 2) ineq::Gini(v) else NA_real_
+    },
+    hhi = {
+      v <- sal_yr$salary[sal_yr$year==first(year) & sal_yr$teamID==first(teamID)]
+      v <- sort(v, decreasing = TRUE)
+      v <- v[!is.na(v) & v > 0]
+      v <- head(v, 25)
+      if(length(v) >= 2) {
+        sh <- v / sum(v)
+        sum(sh^2)
+      } else NA_real_
+    },
+    .groups = "drop"
+  )
+
+# 5) League-wide mean salary to form the payroll ratio
+mlb_avg_salary <- sal_yr %>%
+  group_by(year) %>%
+  summarise(mlb_avg_salary = mean(salary, na.rm = TRUE), .groups = "drop")
+
+# 6) Top-3 paid pitchers’ ERA (salary-weighted) & top-3 paid batters’ RBI (sum)
+pitch_yr <- Pitching %>% transmute(playerID, year = yearID, ERA)
+bat_yr   <- Batting  %>% transmute(playerID, year = yearID, RBI)
+
+top3_feats <- sal_yr %>%
+  group_by(teamID, year) %>%
+  # compute features inside each team-year
+  summarise(
+    top3era = {
+      jp <- left_join(cur_data(), pitch_yr, by = c("playerID","year"))
+      tp <- jp %>% filter(!is.na(ERA)) %>% arrange(desc(salary)) %>% slice_head(n = 3)
+      if(nrow(tp) > 0 && sum(tp$salary) > 0) {
+        w <- tp$salary / sum(tp$salary)
+        sum(w * tp$ERA)
+      } else NA_real_
+    },
+    top3rbi = {
+      jb <- left_join(cur_data(), bat_yr, by = c("playerID","year"))
+      tb <- jb %>% filter(!is.na(RBI)) %>% arrange(desc(salary)) %>% slice_head(n = 3)
+      if(nrow(tb) > 0) sum(tb$RBI, na.rm = TRUE) else NA_real_
+    },
+    .groups = "drop"
+  )
+
+# 7) Manager quality: career winning% up to (and including) that season
+mgr_career <- Managers %>%
+  filter(yearID %in% years) %>%
+  arrange(playerID, yearID) %>%
+  group_by(playerID) %>%
+  mutate(
+    cumW = cumsum(coalesce(W, 0L)),
+    cumL = cumsum(coalesce(L, 0L)),
+    career_wpct = if_else((cumW + cumL) > 0, cumW/(cumW + cumL), NA_real_)
+  ) %>%
+  ungroup() %>%
+  transmute(year = yearID, teamID, career_wpct)
+
+# 8) Assemble panel
+panel <- teams_base %>%
+  left_join(team_pay,       by = c("year","teamID")) %>%
+  left_join(mlb_avg_salary, by = "year") %>%
+  mutate(Tm_mlb_ratio = team_avg_salary / mlb_avg_salary) %>%
+  left_join(top3_feats,     by = c("year","teamID")) %>%
+  left_join(mgr_career,     by = c("year","teamID"))
+
+# 9) Helper to make “Obs, Mean, SD, Min, Max”
+five_num <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  tibble(
+    Obs  = sum(!is.na(x)),
+    Mean = mean(x, na.rm = TRUE),
+    SD   = sd(x,   na.rm = TRUE),
+    Min  = min(x,  na.rm = TRUE),
+    Max  = max(x,  na.rm = TRUE)
+  )
+}
+
+# 10) Build a Table-1 style data frame (variables available from Lahman)
+upper_panel <- bind_rows(
+  five_num(panel$win_pct)           %>% mutate(Variable = "Team winning percentage", .before = 1),
+  five_num(panel$team_avg_salary)   %>% mutate(Variable = "Team average salary (USD)", .before = 1),
+  five_num(panel$Tm_mlb_ratio)      %>% mutate(Variable = "Relative position of team payroll", .before = 1),
+  five_num(panel$gini)              %>% mutate(Variable = "Team Gini coefficient (top-25)", .before = 1),
+  five_num(panel$hhi)               %>% mutate(Variable = "Team HHI (top-25)", .before = 1),
+  five_num(panel$nl)                %>% mutate(Variable = "National League (1=NL)", .before = 1),
+  five_num(panel$career_wpct)       %>% mutate(Variable = "Manager quality (career win%)", .before = 1),
+  five_num(panel$top3era)           %>% mutate(Variable = "Top-3 paid pitchers’ ERA (wtd)", .before = 1),
+  five_num(panel$top3rbi)           %>% mutate(Variable = "Top-3 paid batters’ RBI (sum)", .before = 1)
+)
+
+#Lower panel like paper: league average salaries by year
+nl_al_year_avgs <- sal_yr %>%
+  left_join(Teams %>% select(yearID, teamID, lgID),
+            by = c("year" = "yearID", "teamID" = "teamID")) %>%
+  group_by(year, lgID) %>%
+  summarise(avg_salary = mean(salary, na.rm = TRUE), .groups = "drop")
+
+lower_panel <- bind_rows(
+  five_num(mlb_avg_salary$mlb_avg_salary) %>% mutate(Variable = "Major League average salary (USD)", .before = 1),
+  five_num(nl_al_year_avgs %>% filter(lgID == "NL") %>% pull(avg_salary)) %>%
+    mutate(Variable = "National League average salary (USD)", .before = 1),
+  five_num(nl_al_year_avgs %>% filter(lgID == "AL") %>% pull(avg_salary)) %>%
+    mutate(Variable = "American League average salary (USD)", .before = 1)
+)
+
+table1_desc <- bind_rows(upper_panel, lower_panel)
+
+# 11) Pretty printing & a CSV (no extra packages required)
+table1_desc %>%
+  arrange(Variable) %>%
+  print(n = Inf, width = Inf)
+
+# Save to disk if you want:
+# readr::write_csv(table1_desc, "table1_descriptives.csv")
+
+```
+
