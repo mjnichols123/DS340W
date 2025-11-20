@@ -1,0 +1,210 @@
+---
+title: "NFL Salary Model"
+author: "Jacob Cohen"
+date: "2025-11-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+
+Offense <- read.csv("~/Downloads/NFL Data/merged_players_offense_yearly_combined.csv")
+```
+
+```{r}
+offense_clean <- Offense %>%
+  filter(!is.na(value__cmb), value__cmb > 0) %>%
+  # create age (approximate)
+  mutate(
+    age = season__yr_off - birth_year__yr_off,
+    # guard against weird ages
+    age = if_else(age < 18 | age > 45, NA_real_, age)
+  )
+```
+
+```{r}
+offense_pos <- offense_clean %>%
+  mutate(
+    pos_group = case_when(
+      season_passing_yards__yr_off > 0 ~ "QB",
+      season_rushing_yards__yr_off > 0 &
+        season_receiving_yards__yr_off < 300 ~ "RB",
+      season_receiving_yards__yr_off >= 300 ~ "WR_TE",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  filter(pos_group != "Other")
+```
+
+```{r}
+standardize <- function(x) as.numeric(scale(x))
+
+regression_metrics <- function(actual, predicted) {
+  rmse <- sqrt(mean((predicted - actual)^2))
+  ss_res <- sum((actual - predicted)^2)
+  ss_tot <- sum((actual - mean(actual))^2)
+  r2 <- 1 - ss_res / ss_tot
+  tibble(RMSE = rmse, R2 = r2)
+}
+```
+
+```{r}
+split_three_way <- function(dat, train_prop = 0.6, test_prop = 0.2, seed = 340) {
+  stopifnot(train_prop + test_prop < 1)
+  set.seed(seed)
+  n <- nrow(dat)
+  idx_all <- sample(1:n, size = n, replace = FALSE)
+  
+  n_train <- floor(train_prop * n)
+  n_test  <- floor(test_prop * n)
+  
+  train_idx <- idx_all[1:n_train]
+  test_idx  <- idx_all[(n_train + 1):(n_train + n_test)]
+  val_idx   <- idx_all[(n_train + n_test + 1):n]
+  
+  list(
+    train = dat[train_idx, , drop = FALSE],
+    test  = dat[test_idx, , drop = FALSE],
+    val   = dat[val_idx, , drop = FALSE]
+  )
+}
+```
+
+```{r}
+fit_position_model <- function(dat, pos_label) {
+  message("----- Fitting model for position group: ", pos_label, " -----")
+  
+  dat_pos <- dat %>%
+    filter(pos_group == pos_label) %>%
+    # select columns we need for this position
+    mutate(
+      # controls
+      age        = age,
+      years_exp  = years_exp__yr_off,
+      # QB-like features (even if not used for RB/WR models, we can still create them)
+      pass_yards = season_passing_yards__yr_off,
+      pass_tds   = season_pass_touchdown__yr_off,
+      ints       = interception__yr_off,
+      pass_att   = season_pass_attempts__yr_off,
+      # RB-like features
+      rush_yards = season_rushing_yards__yr_off,
+      rush_att   = season_rush_attempts__yr_off,
+      rush_tds   = season_rush_touchdown__yr_off,
+      # WR-like features
+      recs       = season_receptions__yr_off,
+      rec_yards  = season_receiving_yards__yr_off,
+      rec_tds    = season_receiving_touchdown__yr_off,
+      # response variable (log contract value)
+      log_value  = log(value__cmb)
+    ) %>%
+    # drop rows with missing key variables
+    drop_na(log_value, age, years_exp)
+  
+  if (nrow(dat_pos) < 30) {
+    message("Not enough observations for ", pos_label, " after cleaning; skipping.")
+    return(NULL)
+  }
+  
+  # Standardize features within the position group
+  dat_pos <- dat_pos %>%
+    mutate(
+      age_z       = standardize(age),
+      exp_z       = standardize(years_exp),
+      pass_yards_z = standardize(pass_yards),
+      pass_tds_z   = standardize(pass_tds),
+      ints_z       = standardize(ints),
+      pass_att_z   = standardize(pass_att),
+      rush_yards_z = standardize(rush_yards),
+      rush_att_z   = standardize(rush_att),
+      rush_tds_z   = standardize(rush_tds),
+      recs_z       = standardize(recs),
+      rec_yards_z  = standardize(rec_yards),
+      rec_tds_z    = standardize(rec_tds)
+    )
+  
+  # Choose a model formula tailored to the position group
+  formula_pos <- switch(
+    pos_label,
+    
+    "QB" = log_value ~ age_z + exp_z +
+      pass_yards_z + pass_tds_z + ints_z + pass_att_z,
+    
+    "RB" = log_value ~ age_z + exp_z +
+      rush_yards_z + rush_att_z + rush_tds_z + recs_z + rec_yards_z,
+    
+    "WR_TE" = log_value ~ age_z + exp_z +
+      rec_yards_z + recs_z + rec_tds_z,
+    
+    # default (if something unexpected happens)
+    log_value ~ age_z + exp_z
+  )
+  
+  # Split into train/test/validation
+  splits <- split_three_way(dat_pos, train_prop = 0.6, test_prop = 0.2, seed = 340)
+  train_dat <- splits$train
+  test_dat  <- splits$test
+  val_dat   <- splits$val
+  
+  # Fit model
+  fit <- lm(formula_pos, data = train_dat)
+  message("Model fit for ", pos_label, " complete.")
+  
+  # Test metrics
+  test_pred <- predict(fit, newdata = test_dat)
+  test_metrics <- regression_metrics(test_dat$log_value, test_pred) %>%
+    mutate(set = "test", pos_group = pos_label)
+  
+  # Validation metrics
+  val_pred <- predict(fit, newdata = val_dat)
+  val_metrics <- regression_metrics(val_dat$log_value, val_pred) %>%
+    mutate(set = "validation", pos_group = pos_label)
+  
+  list(
+    fit = fit,
+    metrics = bind_rows(test_metrics, val_metrics),
+    data_used = dat_pos
+  )
+}
+
+```
+
+```{r}
+position_groups <- c("QB", "RB", "WR_TE")
+
+results_list <- lapply(position_groups, function(pg) fit_position_model(offense_pos, pg))
+names(results_list) <- position_groups
+
+# Combine metrics into a single summary table
+metrics_summary <- results_list %>%
+  discard(is.null) %>%
+  purrr::map("metrics") %>%
+  bind_rows()
+
+print(metrics_summary)
+```
+
+```{r}
+if (!is.null(results_list[["QB"]])) {
+  cat("\n===== QB Model Coefficients =====\n")
+  print(summary(results_list[["QB"]]$fit))
+}
+
+# Example: RB coefficients
+if (!is.null(results_list[["RB"]])) {
+  cat("\n===== RB Model Coefficients =====\n")
+  print(summary(results_list[["RB"]]$fit))
+}
+
+# Example: WR/TE coefficients
+if (!is.null(results_list[["WR_TE"]])) {
+  cat("\n===== WR/TE Model Coefficients =====\n")
+  print(summary(results_list[["WR_TE"]]$fit))
+}
+```
+
+
+
