@@ -1,0 +1,437 @@
+---
+title: "NFL Salary Modeling by Position Group"
+author: "Jacob Cohen and Michael Nichols"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# 1. Load Packages and Data
+
+```{r}
+library(tidyverse)
+library(knitr)    # tables
+library(broom)    # tidy model output
+library(ggplot2)  # plots
+
+# File paths (assumes the .Rmd lives in the same folder as the CSVs)
+Offense <- read.csv("~/Downloads/NFL Data/merged_players_offense_yearly_combined.csv")
+Defense <- read.csv("~/Downloads/NFL Data/merged_players_defense_yearly_combined.csv")
+```
+
+# 2. Data Filtering and Position Groups
+
+In this section we restrict the data to the most recent 12 seasons and create
+broad position groups that roughly align with how front offices value players:
+quarterbacks (QB), running backs (RB), pass-catchers (WR/TE), and defense.
+
+```{r}
+# Determine last season year in each dataset
+last_year_off <- max(Offense$season__yr_off, na.rm = TRUE)
+last_year_def <- max(Defense$season__yr_def, na.rm = TRUE)
+
+cutoff_off <- last_year_off - 11
+cutoff_def <- last_year_def - 11
+
+# Offense: keep positive contract values and recent seasons
+offense_clean <- Offense %>%
+  filter(
+    !is.na(value__cmb),
+    value__cmb > 0,
+    season__yr_off >= cutoff_off,
+    season__yr_off <= last_year_off
+  ) %>%
+  mutate(
+    # approximate age from birth year
+    age = season__yr_off - birth_year__yr_off,
+    age = if_else(age < 18 | age > 45, NA_real_, age)
+  ) %>%
+  drop_na(age)
+
+# Production‑based position groups
+offense_pos <- offense_clean %>%
+  mutate(
+    pos_group = case_when(
+      # QBs: have non‑trivial passing yards
+      season_passing_yards__yr_off > 0 ~ "QB",
+      # RBs: rushing‑focused, little receiving volume
+      season_rushing_yards__yr_off > 0 &
+        season_receiving_yards__yr_off < 300 ~ "RB",
+      # WR + TE: primary pass catchers
+      season_receiving_yards__yr_off >= 300 ~ "WR_TE",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  filter(pos_group != "Other")
+
+table(offense_pos$pos_group)
+```
+
+For defense we keep the same 12‑year window and create basic performance
+variables: tackles, sacks, hits, and interceptions.
+
+```{r}
+defense_clean <- Defense %>%
+  filter(
+    !is.na(value__cmb),
+    value__cmb > 0,
+    season__yr_def >= cutoff_def,
+    season__yr_def <= last_year_def
+  ) %>%
+  mutate(
+    age       = age__yr_def,
+    years_exp = seasons_played__yr_def,
+    log_value = log(value__cmb),
+    total_tackles = tackle_with_assist__yr_def,
+    sacks         = sack__yr_def,
+    qb_hits       = qb_hit__yr_def,
+    ints          = interception__yr_def
+  ) %>%
+  drop_na(age, years_exp, log_value,
+          total_tackles, sacks, qb_hits, ints)
+```
+
+# 3. Helper Functions
+
+```{r}
+# Z‑score standardization
+standardize <- function(x) as.numeric(scale(x))
+
+# RMSE and R²
+regression_metrics <- function(actual, predicted) {
+  rmse <- sqrt(mean((predicted - actual)^2))
+  ss_res <- sum((actual - predicted)^2)
+  ss_tot <- sum((actual - mean(actual))^2)
+  r2   <- 1 - ss_res / ss_tot
+  tibble(RMSE = rmse, R2 = r2)
+}
+
+# Train / test / validation split
+split_three_way <- function(dat, train_prop = 0.6, test_prop = 0.2, seed = 340) {
+  stopifnot(train_prop + test_prop < 1)
+  set.seed(seed)
+  n <- nrow(dat)
+  idx_all <- sample(seq_len(n), size = n, replace = FALSE)
+
+  n_train <- floor(train_prop * n)
+  n_test  <- floor(test_prop * n)
+
+  train_idx <- idx_all[1:n_train]
+  test_idx  <- idx_all[(n_train + 1):(n_train + n_test)]
+  val_idx   <- idx_all[(n_train + n_test + 1):n]
+
+  list(
+    train = dat[train_idx, , drop = FALSE],
+    test  = dat[test_idx,  , drop = FALSE],
+    val   = dat[val_idx,   , drop = FALSE]
+  )
+}
+```
+
+# 4. Offensive Regression Models by Position
+
+We fit separate linear regressions within each offensive position group.  
+The response is log(contract value), so coefficients can be interpreted as
+percentage changes in contract value for a one‑standard‑deviation increase in
+a predictor.
+
+```{r}
+fit_position_model <- function(dat, pos_label) {
+  message("----- Fitting model for position group: ", pos_label)
+
+  dat_pos <- dat %>%
+    filter(pos_group == pos_label) %>%
+    mutate(
+      years_exp = years_exp__yr_off,
+      pass_yards = season_passing_yards__yr_off,
+      pass_tds   = season_pass_touchdown__yr_off,
+      ints       = interception__yr_off,
+      pass_att   = season_pass_attempts__yr_off,
+      rush_yards = season_rushing_yards__yr_off,
+      rush_att   = season_rush_attempts__yr_off,
+      rush_tds   = season_rush_touchdown__yr_off,
+      recs       = season_receptions__yr_off,
+      rec_yards  = season_receiving_yards__yr_off,
+      rec_tds    = season_receiving_touchdown__yr_off,
+      log_value  = log(value__cmb)
+    ) %>%
+    drop_na(log_value, age, years_exp)
+
+  if (nrow(dat_pos) < 40) {
+    message("Not enough observations for ", pos_label, " after cleaning; skipping.")
+    return(NULL)
+  }
+
+  dat_pos <- dat_pos %>%
+    mutate(
+      age_z        = standardize(age),
+      exp_z        = standardize(years_exp),
+      pass_yards_z = standardize(pass_yards),
+      pass_tds_z   = standardize(pass_tds),
+      ints_z       = standardize(ints),
+      pass_att_z   = standardize(pass_att),
+      rush_yards_z = standardize(rush_yards),
+      rush_att_z   = standardize(rush_att),
+      rush_tds_z   = standardize(rush_tds),
+      recs_z       = standardize(recs),
+      rec_yards_z  = standardize(rec_yards),
+      rec_tds_z    = standardize(rec_tds)
+    )
+
+  # position‑specific formulas
+  formula_pos <- switch(
+    pos_label,
+    "QB" = log_value ~ age_z + exp_z +
+      pass_yards_z + pass_tds_z + ints_z + pass_att_z,
+    "RB" = log_value ~ age_z + exp_z +
+      rush_yards_z + rush_att_z + rush_tds_z + recs_z + rec_yards_z,
+    "WR_TE" = log_value ~ age_z + exp_z +
+      rec_yards_z + recs_z + rec_tds_z,
+    # default
+    log_value ~ age_z + exp_z
+  )
+
+  splits <- split_three_way(dat_pos, train_prop = 0.6, test_prop = 0.2, seed = 340)
+
+  fit <- lm(formula_pos, data = splits$train)
+
+  # metrics
+  test_pred <- predict(fit, newdata = splits$test)
+  val_pred  <- predict(fit, newdata = splits$val)
+
+  test_metrics <- regression_metrics(splits$test$log_value, test_pred) %>%
+    mutate(set = "test", pos_group = pos_label)
+  val_metrics  <- regression_metrics(splits$val$log_value,  val_pred) %>%
+    mutate(set = "validation", pos_group = pos_label)
+
+  list(
+    fit     = fit,
+    splits  = splits,
+    metrics = bind_rows(test_metrics, val_metrics)
+  )
+}
+
+pos_groups <- c("QB", "RB", "WR_TE")
+off_results <- lapply(pos_groups, function(pg) fit_position_model(offense_pos, pg))
+names(off_results) <- pos_groups
+
+off_metrics <- off_results %>%
+  purrr::discard(is.null) %>%
+  purrr::map("metrics") %>%
+  bind_rows()
+
+off_metrics
+```
+
+### Interpretation
+
+- **RMSE** is the typical prediction error in log(contract value).  
+  Lower bars indicate more accurate salary predictions for that position group.
+- **R²** measures how much of the variance in log(contract value) the model
+  explains. Higher R² means performance stats do a better job of separating
+  higher‑paid from lower‑paid players at that position.
+- It is OK (and interesting) if one group, like WR/TE, has noticeably weaker
+  R² — that suggests contract decisions for that group depend more on factors
+  not captured in basic box‑score stats.
+
+# 5. Defensive Regression Model
+
+```{r}
+defense_model <- defense_clean %>%
+  mutate(
+    age_z      = standardize(age),
+    exp_z      = standardize(years_exp),
+    tackles_z  = standardize(total_tackles),
+    sacks_z    = standardize(sacks),
+    qb_hits_z  = standardize(qb_hits),
+    ints_z     = standardize(ints)
+  )
+
+def_splits <- split_three_way(defense_model, train_prop = 0.6, test_prop = 0.2, seed = 340)
+
+def_fit <- lm(
+  log_value ~ age_z + exp_z + tackles_z + sacks_z + qb_hits_z + ints_z,
+  data = def_splits$train
+)
+
+def_test_pred <- predict(def_fit, newdata = def_splits$test)
+def_val_pred  <- predict(def_fit, newdata = def_splits$val)
+
+def_metrics <- bind_rows(
+  regression_metrics(def_splits$test$log_value, def_test_pred) %>%
+    mutate(set = "test", pos_group = "DEFENSE"),
+  regression_metrics(def_splits$val$log_value,  def_val_pred) %>%
+    mutate(set = "validation", pos_group = "DEFENSE")
+)
+
+def_metrics
+```
+
+# 6. Combined Metrics Table and Plots
+
+```{r}
+all_metrics <- bind_rows(
+  off_metrics %>% mutate(model_type = "Offense"),
+  def_metrics %>% mutate(model_type = "Defense")
+) %>%
+  mutate(
+    pos_group = factor(pos_group, levels = c("QB", "RB", "WR_TE", "DEFENSE")),
+    set = factor(set, levels = c("test", "validation"))
+  )
+
+kable(
+  all_metrics %>% arrange(model_type, pos_group, set),
+  digits = 3,
+  caption = "RMSE and R² by Position Group and Data Split"
+)
+```
+
+```{r}
+ggplot(all_metrics, aes(x = pos_group, y = RMSE, fill = set)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "RMSE by Position Group and Data Split",
+    x = "Position Group",
+    y = "RMSE (log contract value)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+ggplot(all_metrics, aes(x = pos_group, y = R2, fill = set)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "R² by Position Group and Data Split",
+    x = "Position Group",
+    y = "R²"
+  ) +
+  theme_minimal()
+```
+
+### How to Read These Plots
+
+- If **QB** has the highest R² and relatively low RMSE, that supports the idea
+  that quarterback salaries track recent performance pretty closely.
+- If **RB** shows moderate R² with somewhat higher RMSE, it suggests teams
+  consider rushing and receiving production but also weigh other factors like
+  age, workload, and injury risk.
+- If **WR/TE** has low or even negative R², that indicates our simple box‑score
+  stats are not very predictive of contract size for pass‑catchers — an
+  interesting finding you can discuss as a limitation and an avenue for future
+  work.
+- Defensive results summarize how much basic counting stats for defenders
+  explain variation in defensive contract values.
+
+# 7. Coefficient Tables and Visualizations
+
+## 7.1 Offensive Coefficients
+
+```{r}
+get_coef_df <- function(res_obj, label) {
+  if (is.null(res_obj)) return(NULL)
+  broom::tidy(res_obj$fit) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(pos_group = label)
+}
+
+off_coefs <- bind_rows(
+  get_coef_df(off_results$QB, "QB"),
+  get_coef_df(off_results$RB, "RB"),
+  get_coef_df(off_results$WR_TE, "WR_TE")
+)
+
+kable(
+  off_coefs %>%
+    select(pos_group, term, estimate, std.error, statistic, p.value) %>%
+    arrange(pos_group, desc(abs(estimate))),
+  digits = 3,
+  caption = "Offensive Regression Coefficients (Standardized Predictors)"
+)
+```
+
+```{r}
+ggplot(off_coefs, aes(x = term, y = estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_point() +
+  geom_errorbar(
+    aes(ymin = estimate - 1.96 * std.error,
+        ymax = estimate + 1.96 * std.error),
+    width = 0.1
+  ) +
+  coord_flip() +
+  facet_wrap(~ pos_group, scales = "free_y") +
+  labs(
+    title = "Standardized Coefficients by Offensive Position Group",
+    x = "Predictor (z‑score)",
+    y = "Effect on log(contract value)"
+  ) +
+  theme_minimal()
+```
+
+### Interpretation
+
+Because all predictors are standardized (z‑scores), each coefficient tells you:
+
+> “Holding other variables fixed, a one‑standard‑deviation increase in this
+> stat is associated with a `coef × 100%` change in contract value.”
+
+Examples you can pull from your results:
+
+- For QBs, a large positive coefficient on **passing touchdowns** means higher
+  TD totals are strongly associated with larger contracts.
+- For RBs, you might find both **rushing yards** and **receiving yards**
+  matter, reflecting the league’s preference for versatile backs.
+- For WR/TE, small or noisy coefficients reinforce that contracts for
+  pass‑catchers depend on more than just basic volume stats.
+
+## 7.2 Defensive Coefficients
+
+```{r}
+def_coefs <- broom::tidy(def_fit) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(pos_group = "DEFENSE")
+
+kable(
+  def_coefs %>%
+    select(term, estimate, std.error, statistic, p.value),
+  digits = 3,
+  caption = "Defensive Regression Coefficients (Standardized Predictors)"
+)
+```
+
+```{r}
+ggplot(def_coefs, aes(x = term, y = estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_point() +
+  geom_errorbar(
+    aes(ymin = estimate - 1.96 * std.error,
+        ymax = estimate + 1.96 * std.error),
+    width = 0.1
+  ) +
+  coord_flip() +
+  labs(
+    title = "Standardized Coefficients for Defensive Model",
+    x = "Predictor (z‑score)",
+    y = "Effect on log(contract value)"
+  ) +
+  theme_minimal()
+```
+
+### Interpretation
+
+Here you can comment on which defensive stats appear to be most closely tied to
+contract size in your data — for example, whether sacks and QB hits carry more
+weight than total tackles, or whether interceptions show a strong premium.
+
+---
+
+This document gives you:
+
+- Clean, position‑specific linear models for **QB, RB, WR/TE, and defense**.  
+- Performance metrics (RMSE and R²) on test and validation sets.  
+- Visualizations of overall model fit and individual coefficients.  
+- Text that you can adapt directly into the methods and results sections of
+  your paper or presentation.
