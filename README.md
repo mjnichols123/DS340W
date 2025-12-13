@@ -13,7 +13,7 @@ The National Football League (NFL) operates under a hard salary cap, making accu
 
 This project introduces a **position-specific multiple linear regression framework** to estimate NFL player contract values using on-field performance metrics and demographic characteristics. By tailoring predictors to each position group, the models reduce statistical noise and more accurately reflect how different roles are valued in the modern NFL.
 
-The full modeling pipeline is implemented in **R** and follows a reproducible, interpretable, and statistically grounded workflow consistent with the methodology and findings presented in the accompanying research paper :contentReference[oaicite:0]{index=0}.
+The full modeling pipeline is implemented in **R** and follows a reproducible, interpretable, and statistically grounded workflow consistent with the methodology and findings presented in the accompanying research papers.
 
 ---
 
